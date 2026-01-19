@@ -5,6 +5,7 @@
   "dependencies": {
     "@ai-sdk/openai": "^3.0.7",
     "@radix-ui/react-slot": "^1.2.4",
+    "@types/three": "^0.182.0",
     "ai": "^6.0.25",
     "atmn": "^0.0.30",
     "autumn-js": "^0.1.63",
@@ -22,6 +23,7 @@
     "react-icons": "^5.5.0",
     "runable-website-runtime": "^0.0.14",
     "tailwind-merge": "^3.4.0",
+    "three": "^0.182.0",
     "wouter": "^3.9.0",
     "zod": "^4.3.5"
   },
