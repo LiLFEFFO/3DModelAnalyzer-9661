@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import * as THREE from "three";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import occtimportjs from "occt-import-js";
 
 interface ValidationResult {
   name: string;
@@ -47,8 +48,16 @@ interface WallThicknessAnalysis {
   minThickness: number;
   maxThickness: number;
   avgThickness: number;
+  medianThickness: number;
+  stdDeviation: number;
   samples: number[];
   thinAreas: number;
+  borderlineAreas: number;
+  percentBelow1mm: number;
+  percentBelow1_2mm: number;
+  qualityScore: number;
+  qualityGrade: string;
+  sampleCount: number;
 }
 
 interface GeometricComplexity {
@@ -77,6 +86,7 @@ interface ModelData {
   surfaceFeatures: SurfaceFeatureAnalysis;
   wallThickness: WallThicknessAnalysis;
   geometricComplexity: GeometricComplexity;
+  fileFormat?: "STL" | "STEP";
 }
 
 const GUIDELINES = {
@@ -341,69 +351,171 @@ function analyzeSurfaceFeatures(positions: THREE.BufferAttribute, boundingBox: T
   };
 }
 
+// Ray-triangle intersection using Möller–Trumbore algorithm
+function rayTriangleIntersect(
+  rayOrigin: THREE.Vector3,
+  rayDir: THREE.Vector3,
+  v0: THREE.Vector3,
+  v1: THREE.Vector3,
+  v2: THREE.Vector3
+): number | null {
+  const EPSILON = 0.0000001;
+  const edge1 = new THREE.Vector3().subVectors(v1, v0);
+  const edge2 = new THREE.Vector3().subVectors(v2, v0);
+  const h = new THREE.Vector3().crossVectors(rayDir, edge2);
+  const a = edge1.dot(h);
+  
+  if (a > -EPSILON && a < EPSILON) return null;
+  
+  const f = 1.0 / a;
+  const s = new THREE.Vector3().subVectors(rayOrigin, v0);
+  const u = f * s.dot(h);
+  
+  if (u < 0.0 || u > 1.0) return null;
+  
+  const q = new THREE.Vector3().crossVectors(s, edge1);
+  const v = f * rayDir.dot(q);
+  
+  if (v < 0.0 || u + v > 1.0) return null;
+  
+  const t = f * edge2.dot(q);
+  
+  if (t > EPSILON) return t;
+  
+  return null;
+}
+
 function analyzeWallThickness(positions: THREE.BufferAttribute, faceNormals: THREE.Vector3[], boundingBox: THREE.Box3): WallThicknessAnalysis {
   const samples: number[] = [];
   const triangleCount = positions.count / 3;
-  const sampleCount = Math.min(100, Math.floor(triangleCount / 10));
   
-  // Sample points and cast rays to estimate wall thickness
-  for (let s = 0; s < sampleCount; s++) {
-    const triIndex = Math.floor(Math.random() * triangleCount);
-    
-    const v0 = new THREE.Vector3().fromBufferAttribute(positions, triIndex * 3);
-    const v1 = new THREE.Vector3().fromBufferAttribute(positions, triIndex * 3 + 1);
-    const v2 = new THREE.Vector3().fromBufferAttribute(positions, triIndex * 3 + 2);
-    
+  // Use stratified sampling: target 500-1000 samples for good coverage
+  const targetSamples = Math.min(1000, Math.max(500, triangleCount));
+  const sampleStep = Math.max(1, Math.floor(triangleCount / targetSamples));
+  
+  // Pre-build triangle data for efficient ray casting
+  const triangles: { v0: THREE.Vector3; v1: THREE.Vector3; v2: THREE.Vector3; centroid: THREE.Vector3; normal: THREE.Vector3 }[] = [];
+  
+  for (let i = 0; i < triangleCount; i++) {
+    const v0 = new THREE.Vector3().fromBufferAttribute(positions, i * 3);
+    const v1 = new THREE.Vector3().fromBufferAttribute(positions, i * 3 + 1);
+    const v2 = new THREE.Vector3().fromBufferAttribute(positions, i * 3 + 2);
     const centroid = new THREE.Vector3().addVectors(v0, v1).add(v2).divideScalar(3);
-    const normal = faceNormals[triIndex];
+    triangles.push({ v0, v1, v2, centroid, normal: faceNormals[i] });
+  }
+  
+  // Multi-angle ray directions (normal + offset angles)
+  const angleOffsets = [
+    new THREE.Vector3(0, 0, 0), // Normal direction
+    new THREE.Vector3(0.1, 0, 0),
+    new THREE.Vector3(-0.1, 0, 0),
+    new THREE.Vector3(0, 0.1, 0),
+    new THREE.Vector3(0, -0.1, 0),
+  ];
+  
+  // Stratified sampling across triangles
+  for (let i = 0; i < triangleCount; i += sampleStep) {
+    const tri = triangles[i];
+    const normal = tri.normal;
     
-    // Simple ray-mesh intersection estimation
-    const rayOrigin = centroid.clone().add(normal.clone().multiplyScalar(0.01));
-    const rayDir = normal.clone().negate();
-    
-    // Find approximate intersection by sampling opposite faces
-    let minDist = Infinity;
-    for (let i = 0; i < triangleCount; i += 5) {
-      if (i === triIndex) continue;
-      
-      const checkNormal = faceNormals[i];
-      // Only check faces that roughly face the opposite direction
-      if (normal.dot(checkNormal) > -0.5) continue;
-      
-      const cv0 = new THREE.Vector3().fromBufferAttribute(positions, i * 3);
-      const cv1 = new THREE.Vector3().fromBufferAttribute(positions, i * 3 + 1);
-      const cv2 = new THREE.Vector3().fromBufferAttribute(positions, i * 3 + 2);
-      const checkCentroid = new THREE.Vector3().addVectors(cv0, cv1).add(cv2).divideScalar(3);
-      
-      const dist = centroid.distanceTo(checkCentroid);
-      if (dist < minDist && dist > 0.1) {
-        minDist = dist;
+    // Cast rays in multiple directions for each sample point
+    for (const offset of angleOffsets) {
+      // Bidirectional rays: inward and outward
+      for (const direction of [1, -1]) {
+        const rayDir = normal.clone().add(offset).normalize().multiplyScalar(direction);
+        const rayOrigin = tri.centroid.clone().add(rayDir.clone().multiplyScalar(0.01));
+        
+        let minHitDist = Infinity;
+        
+        // Cast ray against all triangles
+        for (let j = 0; j < triangleCount; j++) {
+          if (j === i) continue;
+          
+          const checkTri = triangles[j];
+          // Only consider triangles roughly facing the ray
+          const dotProd = normal.dot(checkTri.normal);
+          if (direction === 1 && dotProd > -0.3) continue;
+          if (direction === -1 && dotProd < 0.3) continue;
+          
+          const hitDist = rayTriangleIntersect(
+            rayOrigin, rayDir,
+            checkTri.v0, checkTri.v1, checkTri.v2
+          );
+          
+          if (hitDist !== null && hitDist > 0.01 && hitDist < minHitDist) {
+            minHitDist = hitDist;
+          }
+        }
+        
+        if (minHitDist < Infinity && minHitDist > 0.01) {
+          samples.push(minHitDist);
+        }
       }
-    }
-    
-    if (minDist < Infinity && minDist > 0) {
-      samples.push(minDist);
     }
   }
 
+  // Fallback if no samples found
   if (samples.length === 0) {
     const size = new THREE.Vector3();
     boundingBox.getSize(size);
     samples.push(Math.min(size.x, size.y, size.z) * 0.1);
   }
 
+  // Sort samples for statistics
   samples.sort((a, b) => a - b);
+  
+  // Calculate comprehensive statistics
   const minThickness = samples[0] || 0;
   const maxThickness = samples[samples.length - 1] || 0;
   const avgThickness = samples.reduce((a, b) => a + b, 0) / samples.length;
+  
+  // Median
+  const midIndex = Math.floor(samples.length / 2);
+  const medianThickness = samples.length % 2 === 0
+    ? (samples[midIndex - 1] + samples[midIndex]) / 2
+    : samples[midIndex];
+  
+  // Standard deviation
+  const variance = samples.reduce((sum, val) => sum + Math.pow(val - avgThickness, 2), 0) / samples.length;
+  const stdDeviation = Math.sqrt(variance);
+  
+  // Count thin areas
   const thinAreas = samples.filter(s => s < GUIDELINES.wallThickness.min).length;
+  const borderlineAreas = samples.filter(s => s >= GUIDELINES.wallThickness.min && s < GUIDELINES.hollowWallThickness).length;
+  
+  // Percentages
+  const percentBelow1mm = (thinAreas / samples.length) * 100;
+  const percentBelow1_2mm = ((thinAreas + borderlineAreas) / samples.length) * 100;
+  
+  // Calculate quality score (0-100)
+  // Based on: % above threshold, consistency (low std dev), and minimum thickness
+  const thicknessScore = Math.min(100, (minThickness / GUIDELINES.wallThickness.min) * 50);
+  const consistencyScore = Math.max(0, 30 - (stdDeviation / avgThickness) * 30);
+  const coverageScore = Math.max(0, 20 - percentBelow1mm);
+  const qualityScore = Math.round(thicknessScore + consistencyScore + coverageScore);
+  
+  // Quality grade
+  let qualityGrade: string;
+  if (qualityScore >= 90) qualityGrade = "Eccellente";
+  else if (qualityScore >= 75) qualityGrade = "Buono";
+  else if (qualityScore >= 50) qualityGrade = "Accettabile";
+  else if (qualityScore >= 25) qualityGrade = "Critico";
+  else qualityGrade = "Insufficiente";
 
   return {
     minThickness,
     maxThickness,
     avgThickness,
+    medianThickness,
+    stdDeviation,
     samples,
     thinAreas,
+    borderlineAreas,
+    percentBelow1mm,
+    percentBelow1_2mm,
+    qualityScore,
+    qualityGrade,
+    sampleCount: samples.length,
   };
 }
 
@@ -562,6 +674,76 @@ function analyzeSTLGeometry(geometry: THREE.BufferGeometry): ModelData {
     surfaceFeatures,
     wallThickness,
     geometricComplexity,
+    fileFormat: "STL",
+  };
+}
+
+async function parseSTEPFile(fileBuffer: ArrayBuffer): Promise<THREE.BufferGeometry> {
+  // Configure WASM location for occt-import-js
+  const occt = await occtimportjs({
+    locateFile: (file: string) => {
+      if (file.endsWith('.wasm')) {
+        return './occt-import-js.wasm';
+      }
+      return file;
+    }
+  });
+  const fileContent = new Uint8Array(fileBuffer);
+  
+  const result = occt.ReadStepFile(fileContent, {
+    linearUnit: "millimeter",
+    linearDeflectionType: "bounding_box_ratio",
+    linearDeflection: 0.001,
+    angularDeflection: 0.5
+  });
+  
+  if (!result.success || result.meshes.length === 0) {
+    throw new Error("Impossibile analizzare il file STEP");
+  }
+  
+  // Combine all meshes into a single geometry
+  const geometry = new THREE.BufferGeometry();
+  const positions: number[] = [];
+  const normals: number[] = [];
+  
+  for (const mesh of result.meshes) {
+    const meshPositions = mesh.attributes.position.array;
+    const meshNormals = mesh.attributes.normal?.array;
+    const indices = mesh.index.array;
+    
+    // Convert indexed geometry to non-indexed for consistency with STL
+    for (let i = 0; i < indices.length; i++) {
+      const idx = indices[i];
+      positions.push(
+        meshPositions[idx * 3],
+        meshPositions[idx * 3 + 1],
+        meshPositions[idx * 3 + 2]
+      );
+      if (meshNormals) {
+        normals.push(
+          meshNormals[idx * 3],
+          meshNormals[idx * 3 + 1],
+          meshNormals[idx * 3 + 2]
+        );
+      }
+    }
+  }
+  
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  if (normals.length > 0) {
+    geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  } else {
+    geometry.computeVertexNormals();
+  }
+  
+  return geometry;
+}
+
+function analyzeSTEPGeometry(geometry: THREE.BufferGeometry): ModelData {
+  const stlData = analyzeSTLGeometry(geometry);
+  return {
+    ...stlData,
+    fileFormat: "STEP",
   };
 }
 
@@ -704,9 +886,24 @@ function validateModel(data: ModelData): ValidationResult[] {
     passed: wallOk,
     severity: wallOk ? "info" : (data.wallThickness.minThickness < GUIDELINES.wallThickness.min ? "error" : "warning"),
     message: wallOk
-      ? `Spessore OK: ${data.wallThickness.minThickness.toFixed(2)} - ${data.wallThickness.maxThickness.toFixed(2)} mm`
-      : `Spessore fuori range: ${data.wallThickness.minThickness.toFixed(2)} - ${data.wallThickness.maxThickness.toFixed(2)} mm`,
-    details: `Min: ${data.wallThickness.minThickness.toFixed(3)}mm. Max: ${data.wallThickness.maxThickness.toFixed(3)}mm. Media: ${data.wallThickness.avgThickness.toFixed(3)}mm. Campioni: ${data.wallThickness.samples.length}. Aree sottili (<1mm): ${data.wallThickness.thinAreas}. Range richiesto: ${GUIDELINES.wallThickness.min}-${GUIDELINES.wallThickness.max}mm.`,
+      ? `Spessore OK: ${data.wallThickness.minThickness.toFixed(2)} - ${data.wallThickness.maxThickness.toFixed(2)} mm | Qualità: ${data.wallThickness.qualityGrade}`
+      : `Spessore fuori range: ${data.wallThickness.minThickness.toFixed(2)} - ${data.wallThickness.maxThickness.toFixed(2)} mm | Qualità: ${data.wallThickness.qualityGrade}`,
+    details: `STATISTICHE DETTAGLIATE:
+• Minimo: ${data.wallThickness.minThickness.toFixed(4)}mm | Massimo: ${data.wallThickness.maxThickness.toFixed(4)}mm
+• Media: ${data.wallThickness.avgThickness.toFixed(4)}mm | Mediana: ${data.wallThickness.medianThickness.toFixed(4)}mm
+• Deviazione Standard: ${data.wallThickness.stdDeviation.toFixed(4)}mm
+• Punteggio Qualità: ${data.wallThickness.qualityScore}/100 (${data.wallThickness.qualityGrade})
+
+ANALISI CAMPIONAMENTO:
+• Punti campionati: ${data.wallThickness.sampleCount.toLocaleString()}
+• Raggi multi-angolo con ray-casting bidirezionale
+
+AREE CRITICHE:
+• Aree <1mm: ${data.wallThickness.thinAreas} (${data.wallThickness.percentBelow1mm.toFixed(2)}% della superficie)
+• Aree borderline 1-1.2mm: ${data.wallThickness.borderlineAreas} (${(data.wallThickness.percentBelow1_2mm - data.wallThickness.percentBelow1mm).toFixed(2)}% aggiuntivo)
+• Totale <1.2mm: ${data.wallThickness.percentBelow1_2mm.toFixed(2)}%
+
+Range richiesto: ${GUIDELINES.wallThickness.min}-${GUIDELINES.wallThickness.max}mm`,
   });
 
   // 9. Base di Appoggio
@@ -1048,11 +1245,51 @@ function DataPanel({ data }: DataPanelProps) {
           <SectionHeader id="walls" title="Spessore Parete" icon="🧱" />
           {expandedSections.walls && (
             <div className="pb-2 border-t border-white/5">
+              {/* Quality Indicator */}
+              <div className="px-3 py-3 bg-white/5 border-b border-white/5">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-white/60 text-sm">Qualità Spessore</span>
+                  <span className={`font-bold text-lg ${
+                    data.wallThickness.qualityScore >= 75 ? 'text-emerald-400' :
+                    data.wallThickness.qualityScore >= 50 ? 'text-amber-400' :
+                    'text-red-400'
+                  }`}>
+                    {data.wallThickness.qualityGrade} ({data.wallThickness.qualityScore}/100)
+                  </span>
+                </div>
+                <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
+                  <div 
+                    className={`h-full transition-all ${
+                      data.wallThickness.qualityScore >= 75 ? 'bg-emerald-500' :
+                      data.wallThickness.qualityScore >= 50 ? 'bg-amber-500' :
+                      'bg-red-500'
+                    }`}
+                    style={{ width: `${data.wallThickness.qualityScore}%` }}
+                  />
+                </div>
+              </div>
+              
+              {/* Core Measurements */}
               <DataRow label="Spessore Minimo" value={data.wallThickness.minThickness.toFixed(4)} unit="mm" highlight={data.wallThickness.minThickness < 1} />
               <DataRow label="Spessore Massimo" value={data.wallThickness.maxThickness.toFixed(4)} unit="mm" />
               <DataRow label="Spessore Medio" value={data.wallThickness.avgThickness.toFixed(4)} unit="mm" />
-              <DataRow label="Punti Campionati" value={data.wallThickness.samples.length} />
+              <DataRow label="Spessore Mediano" value={data.wallThickness.medianThickness.toFixed(4)} unit="mm" />
+              <DataRow label="Deviazione Standard" value={data.wallThickness.stdDeviation.toFixed(4)} unit="mm" />
+              
+              {/* Sampling Info */}
+              <div className="px-3 py-2 border-t border-white/5 mt-2">
+                <p className="text-white/40 text-xs uppercase tracking-wider mb-2">Analisi Campionamento</p>
+              </div>
+              <DataRow label="Punti Campionati" value={data.wallThickness.sampleCount.toLocaleString()} />
+              
+              {/* Thin Area Detection */}
+              <div className="px-3 py-2 border-t border-white/5 mt-2">
+                <p className="text-white/40 text-xs uppercase tracking-wider mb-2">Aree Critiche</p>
+              </div>
               <DataRow label="Aree Sottili (<1mm)" value={data.wallThickness.thinAreas} highlight={data.wallThickness.thinAreas > 0} />
+              <DataRow label="Aree Borderline (1-1.2mm)" value={data.wallThickness.borderlineAreas} highlight={data.wallThickness.borderlineAreas > 0} />
+              <DataRow label="% Superficie <1mm" value={data.wallThickness.percentBelow1mm.toFixed(2)} unit="%" highlight={data.wallThickness.percentBelow1mm > 0} />
+              <DataRow label="% Superficie <1.2mm" value={data.wallThickness.percentBelow1_2mm.toFixed(2)} unit="%" highlight={data.wallThickness.percentBelow1_2mm > 5} />
             </div>
           )}
         </div>
@@ -1094,9 +1331,13 @@ function Index() {
   const [showDataPanel, setShowDataPanel] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const processFile = useCallback((file: File) => {
-    if (!file.name.toLowerCase().endsWith(".stl")) {
-      setError("Per favore carica un file STL");
+  const processFile = useCallback(async (file: File) => {
+    const lowerName = file.name.toLowerCase();
+    const isSTL = lowerName.endsWith(".stl");
+    const isSTEP = lowerName.endsWith(".step") || lowerName.endsWith(".stp");
+    
+    if (!isSTL && !isSTEP) {
+      setError("Per favore carica un file STL o STEP/STP");
       return;
     }
 
@@ -1104,26 +1345,28 @@ function Index() {
     setError("");
     setFileName(file.name);
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      
+      if (isSTL) {
         const loader = new STLLoader();
-        const geometry = loader.parse(e.target?.result as ArrayBuffer);
+        const geometry = loader.parse(arrayBuffer);
         const data = analyzeSTLGeometry(geometry);
         setModelData(data);
         setValidationResults(validateModel(data));
-      } catch (err) {
-        setError("Errore nel parsing del file STL");
-        console.error(err);
-      } finally {
-        setIsLoading(false);
+      } else {
+        // STEP/STP file
+        const geometry = await parseSTEPFile(arrayBuffer);
+        const data = analyzeSTEPGeometry(geometry);
+        setModelData(data);
+        setValidationResults(validateModel(data));
       }
-    };
-    reader.onerror = () => {
-      setError("Errore nella lettura del file");
+    } catch (err) {
+      setError(isSTL ? "Errore nel parsing del file STL" : "Errore nel parsing del file STEP");
+      console.error(err);
+    } finally {
       setIsLoading(false);
-    };
-    reader.readAsArrayBuffer(file);
+    }
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -1159,7 +1402,7 @@ function Index() {
             </h1>
             
             <p className="text-lg md:text-xl text-white/60 max-w-2xl mb-12 leading-relaxed">
-              Analisi avanzata di file STL con validazione precisa secondo le linee guida di produzione italiana. 
+              Analisi avanzata di file STL e STEP/STP con validazione precisa secondo le linee guida di produzione italiana. 
               Estrazione completa di dati geometrici, spigoli, cavità, spessore parete e complessità.
             </p>
 
@@ -1170,7 +1413,7 @@ function Index() {
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
               </svg>
-              Carica File STL
+              Carica File STL/STEP
             </button>
           </div>
         </div>
@@ -1194,7 +1437,7 @@ function Index() {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".stl"
+            accept=".stl,.step,.stp"
             onChange={handleFileChange}
             className="hidden"
           />
@@ -1206,9 +1449,9 @@ function Index() {
               </svg>
             </div>
             <p className="text-xl font-medium mb-2">
-              {isDragging ? "Rilascia il file qui" : "Trascina il file STL qui"}
+              {isDragging ? "Rilascia il file qui" : "Trascina il file STL o STEP qui"}
             </p>
-            <p className="text-white/50">oppure clicca per selezionare</p>
+            <p className="text-white/50">oppure clicca per selezionare • Formati: .stl, .step, .stp</p>
           </div>
         </div>
 
@@ -1233,6 +1476,9 @@ function Index() {
           <div className="flex flex-wrap items-center gap-4 mb-8">
             <h2 className="text-2xl font-bold">{fileName}</h2>
             <div className="flex gap-2">
+              <span className="px-3 py-1 rounded-full bg-blue-500/20 text-blue-400 text-sm font-medium">
+                {modelData.fileFormat || "STL"}
+              </span>
               <span className="px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-sm font-medium">
                 {passedCount} OK
               </span>
@@ -1397,7 +1643,7 @@ function Index() {
       {/* Footer */}
       <footer className="max-w-6xl mx-auto px-6 py-8 border-t border-white/10">
         <p className="text-center text-white/40 text-sm">
-          Validatore STL Pro per stampa 3D industriale • Analisi avanzata secondo linee guida manifattura italiana
+          Validatore 3D Pro per stampa industriale • Supporta STL e STEP/STP • Analisi avanzata secondo linee guida manifattura italiana
         </p>
       </footer>
 
