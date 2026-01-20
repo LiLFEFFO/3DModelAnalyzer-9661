@@ -1151,11 +1151,6 @@ function Index() {
         
         <div className="relative max-w-6xl mx-auto px-6 py-20 md:py-32">
           <div className="animate-fade-in">
-            <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-white/10 bg-white/5 mb-8">
-              <span className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
-              <span className="text-sm text-white/70 font-mono">VALIDATORE 3D PRO</span>
-            </div>
-            
             <h1 className="text-5xl md:text-7xl lg:text-8xl font-bold tracking-tight mb-6">
               <span className="block">Valida il tuo</span>
               <span className="block text-transparent bg-clip-text bg-gradient-to-r from-white via-white to-white/50">
