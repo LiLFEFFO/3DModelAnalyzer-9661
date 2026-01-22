@@ -1,1 +1,15 @@
-{"id":"3j8j8ha08vbvvtaivvhyaq4daz6opw6d","name":"My Website","description":"A website built with Runable","url":"https://example.com","ogImage":"/og-image.png","favicon":"/vite.svg","twitter":{"card":"summary_large_image","site":"@runable"},"themeColor":"#000000","previewPort":8670,"previewUrl":"https://8670-iyzxq7nddd2v7xul3mbrr.e2b.app"}
+{
+  "id": "3j8j8ha08vbvvtaivvhyaq4daz6opw6d",
+  "name": "3D-Model-Analyzer",
+  "description": "A website built with Runable",
+  "url": "https://example.com",
+  "ogImage": "/og-image.png",
+  "favicon": "/vite.svg",
+  "twitter": {
+    "card": "summary_large_image",
+    "site": "@runable"
+  },
+  "themeColor": "#000000",
+  "previewPort": 8670,
+  "previewUrl": "https://8670-iyzxq7nddd2v7xul3mbrr.e2b.app"
+}
